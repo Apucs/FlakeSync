@@ -55,11 +55,8 @@ public class RunWithDelaysMojo extends FlakeSyncAbstractMojo {
 
     int[] delays = {100, 200, 400, 800, 1600, 3200, 6400, 12800};
 
-    private SimilaritySearch similarity;
-
     @Override
     public void execute() throws MojoExecutionException, MojoFailureException {
-        this.similarity = new SimilaritySearch("DELAY", this.mavenProject.getBasedir().toString(), testName);
         super.execute();
         Logger.getGlobal().log(Level.INFO, ("Running RunWithDelaysMojo"));
 
@@ -74,7 +71,8 @@ public class RunWithDelaysMojo extends FlakeSyncAbstractMojo {
             try {
                 this.executeSurefireExecution(null, cleanExec);
             } catch (MojoExecutionException mee) {
-                similarity.judge(cleanExec.getExecutionId());   // record the baseline failure for later stages
+                SimilaritySearch.saveBaseline(this.mavenProject.getBasedir().toString(), testName,
+                        cleanExec.getExecutionId());   // the baseline failure for later stages
                 break;
             } catch (Throwable exception) {
                 System.out.println("Surefire Execution failed: " + exception);

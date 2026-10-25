@@ -26,7 +26,7 @@ import java.util.regex.Pattern;
  */
 public final class SimilaritySearch {
 
-    public enum Verdict { SELF, TARGET, MATCH, SAMETEST, REJECT, UNREADABLE }
+    public enum Verdict { SELF, MATCH, SAMETEST, REJECT, UNREADABLE }
 
     /** Frames from the test framework and JDK: identical for every failure, so they carry no signal. */
     private static final String[] SCAFFOLDING = {"org.junit", "sun.reflect", "jdk.internal", "java.base",
@@ -36,26 +36,28 @@ public final class SimilaritySearch {
     private final String baseDir;
     private final String testName;
     private final double threshold;
-    private Failure target;
+    private final Failure target;
 
     // in: ("DD", "<module dir>", "org.apache.uniffle.common.rpc.GrpcServerTest#testGrpcExecutorPool")
     public SimilaritySearch(String stage, String baseDir, String testName) {
         this.stage = stage;
         this.baseDir = baseDir;
         this.testName = testName;
-        this.threshold = Double.parseDouble(System.getProperty("flakesync.similarityThreshold", "0.8"));
+        this.threshold = Double.parseDouble(System.getProperty("flakesync.similarityThreshold", "0.9"));
         this.target = loadTarget();
-        if (this.target != null) {
-            System.out.println(stage + " TARGET(loaded)  " + shown(this.target.signature));
-            // out (log): DD TARGET(loaded)  org.opentest4j.AssertionFailedError: expected: <n.n> but was: <n.n>
-            //    @GrpcServerTest:90 | ...
+        if (this.target == null) {
+            // delaylocs writes the baseline; without it the stage stops here.
+            throw new IllegalStateException("No baseline from delaylocs: " + targetFile());
         }
+        System.out.println(stage + " BASELINE  " + shown(this.target.signature));
+        // out (log): DD BASELINE  org.opentest4j.AssertionFailedError: expected: <n.n> but was: <n.n>
+        //    @GrpcServerTest:90 | ...
     }
 
     /** True unless this run failed in a clearly different way from the target. */
     // in: executionId "clean_3+EGtp3wuz0wHAV2BajvRMH8u3whjf2O3O4d8tCJBY="
     public boolean accepts(String executionId) {
-        // out: MATCH / SAMETEST / TARGET / SELF / UNREADABLE -> true;  REJECT -> false
+        // out: MATCH / SAMETEST / SELF / UNREADABLE -> true;  REJECT -> false
         return judge(executionId) != Verdict.REJECT;
     }
 
@@ -72,29 +74,16 @@ public final class SimilaritySearch {
             // out: SELF  e.g. "org.junit...TestTimedOutException: test timed out after n seconds @CompatibilityTest:167"
             return Verdict.SELF;
         }
-        if (target == null) {
-            target = failure;
-            saveTarget(failure);
-            System.out.println(stage + " TARGET  " + shown(failure.signature));
-            // out: TARGET  e.g. "org.opentest4j.AssertionFailedError: expected: <n.n> but was: <n.n> @GrpcServerTest:90
-            //    | at ..."
-            return Verdict.TARGET;
-        }
         double score = jaccard(failure.signature, target.signature);
         // Same exception in the same test class is the same test failing, whichever
         // assertion caught it; the message only says which check came first.
-        boolean sameTest = failure.type.equals(target.type)
+        boolean sameTest = Boolean.parseBoolean(System.getProperty("flakesync.sameTestRule", "false"))
+                && failure.type.equals(target.type)
                 && !failure.frameClass.equals("none") && failure.frameClass.equals(target.frameClass);
         Verdict verdict = score >= threshold ? Verdict.MATCH : sameTest ? Verdict.SAMETEST : Verdict.REJECT;
         System.out.printf("%s %-8s %.2f  %s%n", stage, verdict, score, shown(failure.signature));
         // out: MATCH 1.00 (same line) | SAMETEST 0.64 (@GrpcServerTest:92, same test) | REJECT 0.04 (a RemotingException)
         return verdict;
-    }
-
-    // out: the Failure adopted at TARGET (or loaded from the handoff file); null before the first real failure
-    public Failure target() {
-        // out: Failure{type "org.opentest4j.AssertionFailedError", frame "GrpcServerTest:90", ...} or null
-        return target;
     }
 
     /** The one failure Surefire recorded in a run's TEST-*.xml, or null if the run passed. */
@@ -219,9 +208,22 @@ public final class SimilaritySearch {
         return new File(String.valueOf(Constants.getTargetFailureFilepath(baseDir, testName)));
     }
 
-    // in: the adopted Failure.  Writes 4 lines: type / frame / message / frames  (see loadTarget for the sample)
-    private void saveTarget(Failure failure) {
-        try (BufferedWriter out = new BufferedWriter(new FileWriter(targetFile()))) {
+    /** delaylocs calls this once, on its failing run: writes the baseline unless the failure was self-inflicted. */
+    // in: ("<module dir>", "org.apache.uniffle.common.rpc.GrpcServerTest#testGrpcExecutorPool", "clean_0XQmf3...")
+    public static void saveBaseline(String baseDir, String testName, String executionId) {
+        Failure failure = read(new File(String.valueOf(Constants.getExecutionDir(baseDir, executionId))));
+        if (failure == null) {
+            // out (log): DELAY no baseline: no failure recorded in the report
+            System.out.println("DELAY no baseline: no failure recorded in the report");
+            return;
+        }
+        if (failure.selfInflicted()) {
+            // out (log): DELAY no baseline: self-inflicted  org.junit...TestTimedOutException: test timed out ...
+            System.out.println("DELAY no baseline: self-inflicted  " + shown(failure.signature));
+            return;
+        }
+        File file = new File(String.valueOf(Constants.getTargetFailureFilepath(baseDir, testName)));
+        try (BufferedWriter out = new BufferedWriter(new FileWriter(file))) {
             out.write(failure.type);
             out.newLine();
             out.write(failure.frame);
@@ -230,8 +232,11 @@ public final class SimilaritySearch {
             out.newLine();
             out.write(failure.frames);
             out.newLine();
+            // out (log): DELAY BASELINE  org.opentest4j.AssertionFailedError: expected: <n.n> but was: <n.n>
+            //    @GrpcServerTest:90 | ...
+            System.out.println("DELAY BASELINE  " + shown(failure.signature));
         } catch (IOException ioe) {
-            System.out.println(stage + " could not save target: " + ioe.getMessage());
+            System.out.println("DELAY could not save baseline: " + ioe.getMessage());
         }
     }
 
@@ -240,7 +245,7 @@ public final class SimilaritySearch {
     private Failure loadTarget() {
         File file = targetFile();
         if (!file.exists()) {
-            // out: null  (no earlier stage wrote a baseline; delta debug will learn one)
+            // out: null  (delaylocs wrote no baseline; the constructor turns this into a stop)
             return null;
         }
         try (BufferedReader in = new BufferedReader(new FileReader(file))) {
@@ -248,7 +253,7 @@ public final class SimilaritySearch {
             String frame = in.readLine();
             String message = in.readLine();
             String frames = in.readLine();
-            // out: the same Failure delta debug adopted, rebuilt from the file; trace is "" (not stored, not needed again)
+            // out: the Failure delaylocs saved, rebuilt from the file; trace is "" (not stored, not needed again)
             return type == null || frame == null ? null
                     : new Failure(type, message == null ? "" : message, "", frame, frames == null ? "" : frames);
         } catch (IOException ioe) {
